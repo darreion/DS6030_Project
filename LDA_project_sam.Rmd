@@ -1,0 +1,167 @@
+---
+title: "LDA project"
+author: "Sam Knisely"
+date: "2024-06-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+library(tidymodels)
+library(dplyr)
+library(tidyverse)
+library(yardstick)
+library(patchwork)
+library(discrim)
+```
+
+```{r}
+haiti <- read.csv("HaitiPixels.csv", sep=",", header=TRUE)
+haiti$BT_class <- ifelse(haiti$Class == "Blue Tarp", TRUE, FALSE)
+haiti$BT_class <- as.factor(haiti$BT_class)
+haiti <- subset(haiti, select = -Class)
+haiti_formula <- BT_class ~ .
+
+```
+
+
+```{r cache-prepare-LDA}
+
+#| message: FALSE
+#| warning: FALSE
+#| cache: TRUE
+
+folds <- vfold_cv(haiti, strata=BT_class)
+
+haiti_LDA <- discrim_linear(mode="classification") %>% 
+    set_engine("MASS")
+  
+haiti_LDA_wf <- workflow() %>%
+    add_model(haiti_LDA) %>%
+    add_formula(haiti_formula)
+
+haiti_LDA_fit_cv <- haiti_LDA_wf %>% 
+    fit_resamples(folds, control=control_resamples(save_pred=TRUE))
+
+haiti_LDA_cv_predictions <- collect_predictions(haiti_LDA_fit_cv)
+
+haiti_LDA_cv_metrics <- collect_metrics(haiti_LDA_fit_cv)
+haiti_LDA_cv_metrics
+```
+```{r}
+haiti_LDA_cv_predictions
+```
+
+
+```{r}
+haiti_LDA_roc <- haiti_LDA_cv_predictions %>%
+  roc_curve(truth=BT_class, .pred_TRUE, event_level = "second") %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity)) + geom_line()
+haiti_LDA_roc
+```
+
+```{r}
+haiti_augment <- augment(haiti_LDA_fit_cv, new_data=haiti)
+
+performance_lda <- probably::threshold_perf(lda_data, Hazardous, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, specificity, sensitivity, accuracy))
+
+max_j_index_lda <- performance_lda %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_lda
+
+
+### How to augment a workflow cv object? Need to do this to get thresholds.
+
+# %>% fit(train_data)
+
+### Need to identify RGB variables. Use a method to assign a class. Could find averages of each var in training set for each class and assign based on closest across three vars (calc distance from each average, sum values, use min as class)
+### Can we use titles of files for classification of blue tarps?
+
+
+```
+
+```{r}
+### Looking at training data, blue color is the min for non-blue so could put Blue title for min of non blue titled datasets
+
+averages_train <- haiti %>%
+  group_by(BT_class) %>%
+  summarise(
+    avg_Red = mean(Red, na.rm = TRUE),
+    avg_Green = mean(Green, na.rm = TRUE),
+    avg_Blue = mean(Blue, na.rm = TRUE)
+  )
+
+print(averages_train)
+
+hold57_non_blue <- read.table("orthovnir057_ROI_NON_Blue_Tarps.txt", header=F, skip = 8)
+
+averages_hold57_non_blue <- hold57_non_blue %>%
+  summarise(
+    avg_v8 = mean(V8, na.rm = TRUE),
+    avg_v9 = mean(V9, na.rm = TRUE),
+    avg_v10 = mean(V10, na.rm = TRUE)
+  )
+
+print(averages_hold57_non_blue)
+
+### Can probably classify variables based on this method.
+
+```
+
+```{r}
+hold67_blue <- read.table("orthovnir067_ROI_Blue_Tarps_data.txt", header=F, skip = 1)
+
+```
+
+```{r}
+hold67_blue2 <- read.table("orthovnir067_ROI_Blue_Tarps.txt", header=F, skip = 8)
+### This is likely same data as above table, just use one of them
+
+hold67_blue2 %>% select(V8, V9, V10)
+```
+
+```{r}
+hold67_non_blue <- read.table("orthovnir067_ROI_NOT_Blue_Tarps.txt", header=F, skip = 8)
+
+```
+
+```{r}
+hold69_blue <- read.table("orthovnir069_ROI_Blue_Tarps.txt", header=F, skip=8)
+hold69_non_blue <- read.table("orthovnir069_ROI_NOT_Blue_Tarps.txt", header=F, skip=8)
+
+```
+
+```{r}
+hold78_blue <- read.table("orthovnir078_ROI_Blue_Tarps.txt", header=F, skip=8)
+hold78_non_blue <- read.table("orthovnir078_ROI_NON_Blue_Tarps.txt", header=F, skip=8)
+
+```
+
+
+```{r}
+lda_haiti <- discrim_linear(mode="classification") %>%
+    set_engine("MASS") %>%
+    fit(haiti_formula, data=haiti)
+haiti_augment <- augment(lda_haiti, new_data=haiti)
+names(haiti_augment)[2] <- ".predBlueTarp"
+
+performance_haiti <- probably::threshold_perf(haiti_augment, Class, .predBlueTarp , 
+                                        seq(0.00, 1.0, 0.1), event_level="second")
+metrics_haiti <- pivot_wider(performance_haiti, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti <- roc_curve(haiti_augment, Class, .predBlueTarp, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+```
