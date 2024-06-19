@@ -1,0 +1,89 @@
+---
+title: "Untitled"
+author: "Darreion Bailey"
+date: "2024-06-19"
+output: html_document
+---
+
+```{r setup, , message=FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(MASS)
+library(ggcorrplot)
+library(patchwork)
+library(tidymodels)
+library(GGally)
+```
+
+```{r}
+Haiti<-read.csv("HaitiPixels.csv")
+Haiti$BlueTarp <- ifelse(Haiti$Class == "Blue Tarp", "Yes", "No")
+Haiti$BlueTarp <- factor(Haiti$BlueTarp, levels = c("No", "Yes"))
+```
+
+```{r}
+summary(Haiti)
+```
+
+```{r}
+unique(Haiti$Class)
+```
+
+
+```{r}
+frequency <- Haiti %>% 
+  count(Class)
+
+ggplot(data=frequency, aes(x=Class, y=n, fill=Class)) + 
+  geom_bar(stat = "identity")+
+  labs(title="Dist. of Classes",
+       x="Class",
+       y="Count") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()+
+  geom_text(aes(label = scales::comma(n)), size=4, vjust = 1) +
+  scale_fill_manual(values = c( "Blue Tarp" = "blue",
+                                "Rooftop" = "red", 
+                                "Vegetation" = "green",
+                                "Soil" = "orange",
+                                "Various Non Tarp" = "gray"))+ 
+  guides(fill = FALSE)
+
+```
+```{r}
+ggpairs(Haiti, columns = 2:4, aes(color=BlueTarp, alpha=.8)) +
+  theme_minimal()
+```
+
+```{r}
+# ignoring "orthovnir067_ROI_Blue_Tarps_data.txt", and the .jpg files
+# combining text files for holdout set & separating based on class
+
+non_blue_files <- c("orthovnir057_ROI_NON_Blue_Tarps.txt", "orthovnir067_ROI_NOT_Blue_Tarps.txt", "orthovnir069_ROI_NOT_Blue_Tarps.txt", "orthovnir078_ROI_NON_Blue_Tarps.txt")
+blue_files <- c("orthovnir067_ROI_Blue_Tarps.txt", "orthovnir069_ROI_Blue_Tarps.txt", "orthovnir078_ROI_Blue_Tarps.txt")
+
+
+read_and_label <- function(files, label) {
+  map_df(files, function(file) {
+    data <- read_lines(file, skip = 8)  # Skip metadata
+    
+    df <- read.table(text = data, header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+   
+    df <- df %>% mutate(class = label)
+  
+    colnames(df) <- c("ID", "X", "Y", "Map_X", "Map_Y", "Lat", "Lon", "B1", "B2", "B3", "class")
+    return(df)
+  })
+}
+
+
+non_blue_df <- read_and_label(non_blue_files, "non-blue-tarp")
+blue_df <- read_and_label(blue_files, "blue-tarp")
+
+
+Haiti_holdout <- bind_rows(non_blue_df, blue_df)
+
+
+head(Haiti_holdout)
+```
+
