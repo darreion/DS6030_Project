@@ -1,0 +1,136 @@
+---
+title: "LDA project"
+author: "Sam Knisely"
+date: "2024-06-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+library(tidymodels)
+library(dplyr)
+library(tidyverse)
+library(yardstick)
+library(patchwork)
+library(discrim)
+```
+
+```{r}
+haiti <- read.csv("HaitiPixels.csv", sep=",", header=TRUE)
+haiti$BT_class <- ifelse(haiti$Class == "Blue Tarp", TRUE, FALSE)
+haiti$BT_class <- as.factor(haiti$BT_class)
+haiti <- subset(haiti, select = -Class)
+haiti_formula <- BT_class ~ .
+
+```
+
+
+```{r cache-prepare-LDA}
+
+#| message: FALSE
+#| warning: FALSE
+#| cache: TRUE
+
+folds <- vfold_cv(haiti, strata=BT_class)
+
+haiti_LDA <- discrim_linear(mode="classification") %>% 
+    set_engine("MASS")
+  
+haiti_LDA_wf <- workflow() %>%
+    add_model(haiti_LDA) %>%
+    add_formula(haiti_formula)
+
+haiti_LDA_fit_cv <- haiti_LDA_wf %>% 
+    fit_resamples(folds, control=control_resamples(save_pred=TRUE))
+
+haiti_LDA_cv_predictions <- collect_predictions(haiti_LDA_fit_cv)
+
+haiti_LDA_cv_metrics <- collect_metrics(haiti_LDA_fit_cv)
+
+haiti_LDA_roc <- haiti_LDA_cv_predictions %>%
+  roc_curve(truth=BT_class, .pred_TRUE, event_level = "second") %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity)) + geom_line()
+```
+
+
+
+```{r}
+library(yardstick)
+haiti_LDA_fit <- haiti_LDA_wf %>% fit(haiti)
+
+haiti_augment <- augment(haiti_LDA_fit, new_data=haiti)
+
+performance_lda <- probably::threshold_perf(haiti_augment, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+max_j_index_lda <- performance_lda %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_lda
+
+metrics_lda <- pivot_wider(performance_lda, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti <- roc_curve(haiti_augment, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_lda, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_lda, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti
+
+```
+
+
+# Get model performance metrics at optimal threshold on training data
+```{r}
+
+optimal_threshold <- max_j_index_lda[[1,1]]
+optimal_threshold
+
+metrics_training <- performance_lda %>% filter(.threshold == optimal_threshold)
+metrics_training
+#True positive rate is the sensitvity in this table
+
+lda_auc <- roc_auc(haiti_augment, BT_class, .pred_TRUE, event_level="second")
+lda_auc
+
+specificity <- metrics_training %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr <- 1-specificity
+fpr
+```
+
+```{r}
+### Looking at training data, blue color is the min for non-blue so could put Blue title for min of non blue titled datasets
+
+averages_train <- haiti %>%
+  group_by(BT_class) %>%
+  summarise(
+    avg_Red = mean(Red, na.rm = TRUE),
+    avg_Green = mean(Green, na.rm = TRUE),
+    avg_Blue = mean(Blue, na.rm = TRUE)
+  )
+
+print(averages_train)
+
+hold57_non_blue <- read.table("orthovnir057_ROI_NON_Blue_Tarps.txt", header=F, skip = 8)
+
+averages_hold57_non_blue <- hold57_non_blue %>%
+  summarise(
+    avg_v8 = mean(V8, na.rm = TRUE),
+    avg_v9 = mean(V9, na.rm = TRUE),
+    avg_v10 = mean(V10, na.rm = TRUE)
+  )
+
+print(averages_hold57_non_blue)
+
+### Can classify variables based on this method.
+
+```
+
