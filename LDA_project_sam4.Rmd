@@ -1,0 +1,189 @@
+---
+title: "LDA project"
+author: "Sam Knisely"
+date: "2024-06-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+library(tidymodels)
+library(dplyr)
+library(tidyverse)
+library(yardstick)
+library(patchwork)
+library(discrim)
+```
+
+```{r}
+set.seed(4896)
+haiti <- read.csv("HaitiPixels.csv", sep=",", header=TRUE)
+haiti$BT_class <- ifelse(haiti$Class == "Blue Tarp", TRUE, FALSE)
+haiti$BT_class <- as.factor(haiti$BT_class)
+haiti <- subset(haiti, select = -Class)
+haiti_formula <- BT_class ~ .
+
+```
+
+
+```{r cache-prepare-LDA}
+
+#| message: FALSE
+#| warning: FALSE
+#| cache: TRUE
+
+folds <- vfold_cv(haiti, strata=BT_class)
+
+haiti_LDA <- discrim_linear(mode="classification") %>% 
+    set_engine("MASS")
+  
+haiti_LDA_wf <- workflow() %>%
+    add_model(haiti_LDA) %>%
+    add_formula(haiti_formula)
+
+haiti_LDA_fit_cv <- haiti_LDA_wf %>% 
+    fit_resamples(folds, control=control_resamples(save_pred=TRUE))
+
+haiti_LDA_cv_predictions <- collect_predictions(haiti_LDA_fit_cv)
+
+haiti_LDA_cv_metrics <- collect_metrics(haiti_LDA_fit_cv)
+
+haiti_LDA_roc <- haiti_LDA_cv_predictions %>%
+  roc_curve(truth=BT_class, .pred_TRUE, event_level = "second") %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity)) + geom_line()
+```
+
+
+
+```{r}
+library(yardstick)
+haiti_LDA_fit <- haiti_LDA_wf %>% fit(haiti)
+
+haiti_augment <- augment(haiti_LDA_fit, new_data=haiti)
+
+performance_lda <- probably::threshold_perf(haiti_augment, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+max_j_index_lda <- performance_lda %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_lda
+
+metrics_lda <- pivot_wider(performance_lda, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti <- roc_curve(haiti_augment, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_lda, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_lda, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti
+
+```
+
+
+# Get model performance metrics at optimal threshold on training data
+```{r}
+
+optimal_threshold <- max_j_index_lda[[1,1]]
+optimal_threshold
+
+metrics_training <- performance_lda %>% filter(.threshold == optimal_threshold)
+metrics_training
+
+lda_auc <- roc_auc(haiti_augment, BT_class, .pred_TRUE, event_level="second")
+lda_auc
+
+specificity <- metrics_training %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr <- 1-specificity
+fpr
+```
+```{r}
+# ignoring "orthovnir067_ROI_Blue_Tarps_data.txt", and the .jpg files
+# combining text files for holdout set & separating based on class
+
+non_blue_files <- c("orthovnir057_ROI_NON_Blue_Tarps.txt", "orthovnir067_ROI_NOT_Blue_Tarps.txt", "orthovnir069_ROI_NOT_Blue_Tarps.txt", "orthovnir078_ROI_NON_Blue_Tarps.txt")
+blue_files <- c("orthovnir067_ROI_Blue_Tarps.txt", "orthovnir069_ROI_Blue_Tarps.txt", "orthovnir078_ROI_Blue_Tarps.txt")
+
+
+read_and_label <- function(files, label) {
+  map_df(files, function(file) {
+    data <- read_lines(file, skip = 8)  # Skip metadata
+    
+    df <- read.table(text = data, header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+   
+    df <- df %>% mutate(class = label)
+  
+    colnames(df) <- c("ID", "X", "Y", "Map_X", "Map_Y", "Lat", "Lon", "B1", "B2", "B3", "BT_class")
+    return(df)
+  })
+}
+
+
+non_blue_df <- read_and_label(non_blue_files, "FALSE")
+blue_df <- read_and_label(blue_files, "TRUE")
+
+
+Haiti_holdout <- bind_rows(non_blue_df, blue_df)
+
+Haiti_holdout$BT_class <- as.factor(Haiti_holdout$BT_class)
+
+```
+
+
+```{r}
+### Can classify holdout colors based on this method.
+
+averages_train <- haiti %>%
+  group_by(BT_class) %>%
+  summarise(
+    avg_Red = mean(Red, na.rm = TRUE),
+    avg_Green = mean(Green, na.rm = TRUE),
+    avg_Blue = mean(Blue, na.rm = TRUE)
+  )
+
+print(averages_train)
+
+averages_holdout <- Haiti_holdout %>%
+  group_by(BT_class) %>%
+  summarise(
+    avg_B1 = mean(B1, na.rm = TRUE),
+    avg_B2 = mean(B2, na.rm = TRUE),
+    avg_B3 = mean(B3, na.rm = TRUE)
+  )
+
+print(averages_holdout)
+
+Haiti_holdout <- Haiti_holdout %>%
+  rename(Red = B1,
+         Green = B2,
+         Blue = B3)
+
+Haiti_holdout <- Haiti_holdout %>%
+  dplyr::select(Red, Green, Blue, BT_class)
+```
+
+```{r}
+haiti_augment_test <- augment(haiti_LDA_fit, new_data=Haiti_holdout)
+
+performance_lda_test <- probably::threshold_perf(haiti_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+metrics_test <- performance_lda_test %>% filter(.threshold == optimal_threshold)
+metrics_test
+
+lda_auc <- roc_auc(haiti_augment_test, BT_class, .pred_TRUE, event_level="second")
+lda_auc
+
+specificity_test <- metrics_test %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_test <- 1-specificity_test
+fpr_test
+```
