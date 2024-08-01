@@ -1,0 +1,711 @@
+---
+title: "LDA project"
+author: "Sam Knisely"
+date: "2024-06-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+# Libraries and start cluster
+```{r}
+#| warning: FALSE
+#| message: FALSE
+library(tidymodels)
+library(dplyr)
+#library(tidyverse)
+library(yardstick)
+library(patchwork)
+library(readr)
+library(discrim)
+library(GGally)
+library(doParallel)
+#cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE))
+#registerDoParallel(cl)
+```
+
+# Read in data
+```{r}
+set.seed(4896)
+haiti <- read.csv("HaitiPixels.csv", sep=",", header=TRUE)
+haiti$BT_class <- ifelse(haiti$Class == "Blue Tarp", TRUE, FALSE)
+haiti$BT_class <- as.factor(haiti$BT_class)
+summary(haiti)
+#unique(haiti$Class)
+#haiti<-haiti[sample(1:nrow(haiti),200, replace=FALSE),]
+```
+# EDA graph
+```{r}
+frequency <- haiti %>% 
+  count(Class)
+
+ggplot(data=frequency, aes(x=Class, y=n, fill=Class)) + 
+  geom_bar(stat = "identity")+
+  labs(title="Distribution of Classes",
+       x="Class",
+       y="Count") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()+
+  geom_text(aes(label = scales::comma(n)), size=4, vjust = 1) +
+  scale_fill_manual(values = c( "Blue Tarp" = "blue",
+                                "Rooftop" = "red", 
+                                "Vegetation" = "green",
+                                "Soil" = "orange",
+                                "Various Non Tarp" = "gray"))+ 
+  guides(fill = FALSE)
+
+```
+
+```{r}
+ggpairs(haiti, columns = 2:4, aes(color=BT_class, alpha=.8)) +
+  theme_minimal()
+```
+
+# Create formula
+```{r}
+haiti <- subset(haiti, select = -Class)
+haiti_formula <- BT_class ~ .
+
+```
+
+# Training cross-validation
+```{r cache-prepare-LDA}
+
+#| message: FALSE
+#| warning: FALSE
+#| cache: TRUE
+
+folds <- vfold_cv(haiti, strata=BT_class)
+
+haiti_LDA <- discrim_linear(mode="classification") %>% 
+    set_engine("MASS")
+  
+haiti_LDA_wf <- workflow() %>%
+    add_model(haiti_LDA) %>%
+    add_formula(haiti_formula)
+
+haiti_LDA_fit_cv <- haiti_LDA_wf %>% 
+    fit_resamples(folds, control=control_resamples(save_pred=TRUE))
+
+haiti_LDA_cv_predictions <- collect_predictions(haiti_LDA_fit_cv)
+
+haiti_LDA_cv_metrics <- collect_metrics(haiti_LDA_fit_cv)
+
+haiti_LDA_cv_metrics
+```
+
+
+# Training performance and ROC curve
+```{r}
+library(yardstick)
+haiti_LDA_fit <- haiti_LDA_wf %>% fit(haiti)
+
+haiti_augment <- augment(haiti_LDA_fit, new_data=haiti)
+
+performance_lda <- probably::threshold_perf(haiti_LDA_cv_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+max_j_index_lda <- performance_lda %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_lda
+
+metrics_lda <- pivot_wider(performance_lda, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti <- roc_curve(haiti_LDA_cv_predictions, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_lda, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_lda, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti
+
+```
+
+
+# Get model performance metrics at optimal threshold on training data
+```{r}
+
+optimal_threshold <- max_j_index_lda[[1,1]]
+optimal_threshold
+
+metrics_training <- performance_lda %>% filter(.threshold == optimal_threshold)
+
+metrics_training <- metrics_training %>% dplyr::select(-.estimator)
+
+
+metrics_training %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+lda_auc <- roc_auc(haiti_augment, BT_class, .pred_TRUE, event_level="second")
+lda_auc
+
+specificity <- metrics_training %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr <- 1-specificity
+fpr
+```
+
+# Read in holdout data
+```{r}
+# ignoring "orthovnir067_ROI_Blue_Tarps_data.txt", and the .jpg files
+# combining text files for holdout set & separating based on class
+
+non_blue_files <- c("orthovnir057_ROI_NON_Blue_Tarps.txt", "orthovnir067_ROI_NOT_Blue_Tarps.txt", "orthovnir069_ROI_NOT_Blue_Tarps.txt", "orthovnir078_ROI_NON_Blue_Tarps.txt")
+blue_files <- c("orthovnir067_ROI_Blue_Tarps.txt", "orthovnir069_ROI_Blue_Tarps.txt", "orthovnir078_ROI_Blue_Tarps.txt")
+
+
+read_and_label <- function(files, label) {
+  map_df(files, function(file) {
+    data <- read_lines(file, skip = 8)  # Skip metadata
+    
+    df <- read.table(text = data, header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+   
+    df <- df %>% mutate(class = label)
+  
+    colnames(df) <- c("ID", "X", "Y", "Map_X", "Map_Y", "Lat", "Lon", "B1", "B2", "B3", "BT_class")
+    return(df)
+  })
+}
+
+
+non_blue_df <- read_and_label(non_blue_files, "FALSE")
+blue_df <- read_and_label(blue_files, "TRUE")
+
+
+Haiti_holdout <- bind_rows(non_blue_df, blue_df)
+
+Haiti_holdout$BT_class <- as.factor(Haiti_holdout$BT_class)
+
+```
+
+# Assign B1, B2, B3 variables in holdout set to Red, Green, and Blue
+
+```{r}
+training_set_long <- haiti %>%
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Color", values_to = "num")
+
+ggplot(training_set_long, aes(x = num, color = Color)) +
+  stat_ecdf(geom = "step") +
+  labs(title = "Training Data Empirical Cumulative Distribution Function", x = "Value", y = "ECDF") +
+  scale_color_manual(values = c(Red = "red", Green = "green", Blue = "blue")) +
+  theme_minimal()
+
+```
+
+```{r}
+test_set_long <- Haiti_holdout %>%
+  pivot_longer(cols = c(B1, B2, B3), names_to = "Color", values_to = "num")
+
+ggplot(test_set_long, aes(x = num, color = Color)) +
+  stat_ecdf(geom = "step") +
+  labs(title = "Holdout Data Empirical Cumulative Distribution Function", x = "Value", y = "ECDF") +
+  scale_color_manual(values = c(B1 = "red", B2 = "green", B3 = "blue")) +
+  theme_minimal()
+
+Haiti_holdout <- Haiti_holdout %>%
+  rename(Red = B1,
+         Green = B2,
+         Blue = B3)
+
+Haiti_holdout <- Haiti_holdout %>%
+  dplyr::select(Red, Green, Blue, BT_class)
+```
+
+# Holdout data metrics
+```{r}
+haiti_augment_test <- augment(haiti_LDA_fit, new_data=Haiti_holdout)
+
+performance_lda_test <- probably::threshold_perf(haiti_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+metrics_test <- performance_lda_test %>% filter(.threshold == optimal_threshold)
+metrics_test <- metrics_test %>% dplyr::select(-.estimator)
+
+metrics_test %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+lda_auc <- roc_auc(haiti_augment_test, BT_class, .pred_TRUE, event_level="second")
+lda_auc
+
+specificity_test <- metrics_test %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_test <- 1-specificity_test
+fpr_test
+```
+
+```{r}
+roc_haiti_test <- roc_curve(haiti_augment_test, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot()
+    #geom_point(data=metrics_test, aes(x=1-specificity, y=sensitivity), color='red') +
+    #geom_text(data=metrics_test, aes(x=1-specificity, y=sensitivity, 
+    #          label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_test
+```
+
+# SVM linear model
+```{r}
+recipe <- haiti %>%
+    recipe(BT_class ~ .) %>%
+   # step_pca(num_comp = 2) %>%
+    step_normalize(all_numeric_predictors())
+
+```
+
+```{r}
+
+svm_wf_lin <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(svm_linear(mode="classification", engine="kernlab", 
+                         cost=tune(), margin=tune()))
+
+
+svm_lin_params <- extract_parameter_set_dials(svm_wf_lin)
+
+tune_results_svm_lin <- tune_bayes(svm_wf_lin, resamples=folds, 
+                                   param_info=svm_lin_params, iter=25)
+
+
+```
+
+```{r}
+optimal_svm_lin_roc <- tune_results_svm_lin %>% select_best(metric="roc_auc")
+optimal_svm_lin_roc <- optimal_svm_lin_roc %>% dplyr::select(-.config)
+
+
+optimal_svm_lin_roc %>%
+  rename(
+    Cost = cost,
+    Margin = margin
+  )
+
+```
+```{r}
+
+svm_lin_tuned_cv <- svm_wf_lin %>%
+finalize_workflow(select_best(tune_results_svm_lin, metric="roc_auc")) %>%
+fit_resamples(resamples=folds, control=control_resamples(save_pred=TRUE))
+
+
+#svm_lin_roc <- collect_predictions(svm_lin_tuned_cv) %>%
+#roc_curve(truth=BT_class, .pred_TRUE, event_level="second") %>%
+#autoplot() + labs(title="Tuned SVM with a Linear Kernel ROC")
+
+#svm_lin_roc
+
+svm_lin_metrics <- collect_metrics(svm_lin_tuned_cv)
+svm_lin_metrics
+
+```
+
+```{r}
+svm_lin_fit <- svm_wf_lin %>%
+  finalize_workflow(select_best(tune_results_svm_lin, metric="roc_auc")) %>%
+  fit(haiti)
+
+```
+
+```{r}
+haiti_augment_svm_lin <- augment(svm_lin_fit, new_data=haiti)
+
+haiti_svm_lin_cv_predictions <- collect_predictions(svm_lin_tuned_cv)
+```
+
+```{r}
+performance_svm_lin <- probably::threshold_perf(haiti_svm_lin_cv_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+max_j_index_svm_lin <- performance_svm_lin %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_svm_lin %>% dplyr::select(-.estimator) %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+metrics_svm_lin <- pivot_wider(performance_svm_lin, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+```
+
+```{r}
+roc_haiti_svm_lin <- roc_curve(haiti_svm_lin_cv_predictions, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_svm_lin, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_svm_lin, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_svm_lin
+
+```
+
+```{r}
+optimal_threshold_svm_lin <- max_j_index_svm_lin[[1,1]]
+optimal_threshold_svm_lin
+
+metrics_training_svm_lin <- performance_svm_lin %>% filter(.threshold == optimal_threshold_svm_lin)
+metrics_training_svm_lin <- metrics_training_svm_lin %>% dplyr::select(-.estimator)
+
+
+metrics_training_svm_lin %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+svm_lin_auc <- roc_auc(haiti_augment_svm_lin, BT_class, .pred_TRUE, event_level="second")
+svm_lin_auc
+
+specificity_svm_lin <- metrics_training_svm_lin %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_lin <- 1-specificity_svm_lin
+fpr_svm_lin
+
+```
+
+```{r cache-svm-lin-test}
+
+svm_lin_augment_test <- augment(svm_lin_fit, new_data=Haiti_holdout)
+```
+
+```{r}
+performance_svm_lin_test <- probably::threshold_perf(svm_lin_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+
+```{r}
+metrics_test_svm_lin <- performance_svm_lin_test %>% filter(.threshold == optimal_threshold_svm_lin)
+metrics_test_svm_lin <- metrics_test_svm_lin %>% dplyr::select(-.estimator)
+
+
+metrics_test_svm_lin %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+
+svm_lin_test_auc <- roc_auc(svm_lin_augment_test, BT_class, .pred_TRUE, event_level="second")
+svm_lin_test_auc
+
+specificity_svm_lin_test <- metrics_test_svm_lin %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_lin_test <- 1-specificity_svm_lin_test
+fpr_svm_lin_test
+
+roc_haiti_test_svm_lin <- roc_curve(svm_lin_augment_test, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() 
+    #geom_point(data=metrics_test_svm_lin, aes(x=1-specificity, y=sensitivity), color='red') +
+    #geom_text(data=metrics_test_svm_lin, aes(x=1-specificity, y=sensitivity, 
+    #          label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_test_svm_lin
+```
+
+# SVM Poly Model
+
+```{r}
+
+svm_wf_poly <- workflow() %>%
+add_model(svm_poly(mode="classification", engine="kernlab",
+degree=tune(), cost=tune(), margin=tune())) %>%
+add_recipe(recipe)
+
+svm_wf_poly_params <- extract_parameter_set_dials(svm_wf_poly) %>%
+update(degree=degree_int(c(2, 5)))
+
+tune_results_svm_poly <- tune_bayes(svm_wf_poly, resamples=folds, 
+                                    param_info=svm_wf_poly_params, iter=25)
+
+
+```
+
+```{r}
+optimal_svm_poly_roc <- tune_results_svm_poly %>% select_best(metric="roc_auc")
+optimal_svm_poly_roc <- optimal_svm_poly_roc %>% dplyr::select(-.config)
+optimal_svm_poly_roc %>%
+  rename(
+    Cost = cost,
+    Degree = degree,
+    Margin = margin
+  )
+```
+
+```{r}
+svm_poly_tuned_cv <- svm_wf_poly %>%
+finalize_workflow(select_best(tune_results_svm_poly, metric="roc_auc")) %>%
+fit_resamples(resamples=folds, control=control_resamples(save_pred=TRUE))
+
+svm_poly_metrics <- collect_metrics(svm_poly_tuned_cv)
+svm_poly_metrics
+```
+```{r}
+svm_poly_fit <- svm_wf_poly %>%
+  finalize_workflow(select_best(tune_results_svm_poly, metric="roc_auc")) %>%
+  fit(haiti)
+
+```
+
+```{r}
+haiti_augment_svm_poly <- augment(svm_poly_fit, new_data=haiti)
+
+haiti_svm_poly_cv_predictions <- collect_predictions(svm_poly_tuned_cv)
+```
+
+```{r cache-poly-perf}
+performance_svm_poly <- probably::threshold_perf(haiti_svm_poly_cv_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+
+```{r}
+max_j_index_svm_poly <- performance_svm_poly %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_svm_poly %>% dplyr::select(-.estimator) %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+metrics_svm_poly <- pivot_wider(performance_svm_poly, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti_svm_poly <- roc_curve(haiti_svm_poly_cv_predictions, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_svm_poly, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_svm_poly, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_svm_poly
+
+```
+
+
+```{r}
+optimal_threshold_svm_poly <- max_j_index_svm_poly[[1,1]]
+optimal_threshold_svm_poly
+
+metrics_training_svm_poly <- performance_svm_poly %>% filter(.threshold == optimal_threshold_svm_poly)
+metrics_training_svm_poly <- metrics_training_svm_poly %>% dplyr::select(-.estimator)
+
+
+metrics_training_svm_poly %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+svm_poly_auc <- roc_auc(haiti_augment_svm_poly, BT_class, .pred_TRUE, event_level="second")
+svm_poly_auc
+
+specificity_svm_poly <- metrics_training_svm_poly %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_poly <- 1-specificity_svm_poly
+fpr_svm_poly
+
+```
+
+```{r cache-svm-poly-test}
+
+svm_poly_augment_test <- augment(svm_poly_fit, new_data=Haiti_holdout)
+```
+
+```{r}
+performance_svm_poly_test <- probably::threshold_perf(svm_poly_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+
+```{r}
+metrics_test_svm_poly <- performance_svm_poly_test %>% filter(.threshold == optimal_threshold_svm_poly)
+metrics_test_svm_poly <- metrics_test_svm_poly %>% dplyr::select(-.estimator)
+
+
+metrics_test_svm_poly %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+svm_poly_test_auc <- roc_auc(svm_poly_augment_test, BT_class, .pred_TRUE, event_level="second")
+svm_poly_test_auc
+
+specificity_svm_poly_test <- metrics_test_svm_poly %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_poly_test <- 1-specificity_svm_poly_test
+fpr_svm_poly_test
+
+roc_haiti_test_svm_poly <- roc_curve(svm_poly_augment_test, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() 
+    #geom_point(data=metrics_test_svm_poly, aes(x=1-specificity, y=sensitivity), color='red') +
+    #geom_text(data=metrics_test_svm_poly, aes(x=1-specificity, y=sensitivity, 
+     #         label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_test_svm_poly
+```
+
+# SVM RBF Model
+
+```{r}
+
+svm_wf_rbf <- workflow() %>%
+add_model(svm_rbf(mode="classification", engine="kernlab", 
+                  rbf_sigma = tune(), cost=tune(), margin=tune())) %>%
+add_recipe(recipe)
+
+svm_wf_rbf_params <- extract_parameter_set_dials(svm_wf_rbf)  #%>%
+  #update(rbf_sigma = rbf_sigma(range=c(-4, 0), trans=log10_trans()))
+
+```
+
+```{r}
+tune_results_svm_rbf <- tune_bayes(svm_wf_rbf, resamples=folds, 
+                                   param_info=svm_wf_rbf_params, iter=5)
+
+
+```
+
+```{r}
+optimal_svm_rbf_roc <- tune_results_svm_rbf %>% select_best(metric="roc_auc")
+optimal_svm_rbf_roc <- optimal_svm_rbf_roc %>% dplyr::select(-.config)
+
+
+optimal_svm_rbf_roc %>%
+  rename(
+    Cost = cost,
+    RBF_sigma = rbf_sigma,
+    Margin = margin
+  )
+
+```
+
+
+```{r}
+svm_rbf_tuned_cv <- svm_wf_rbf %>%
+finalize_workflow(select_best(tune_results_svm_rbf, metric="roc_auc")) %>%
+fit_resamples(resamples=folds, control=control_resamples(save_pred=TRUE))
+
+
+svm_rbf_metrics <- collect_metrics(svm_rbf_tuned_cv)
+svm_rbf_metrics
+```
+```{r}
+svm_rbf_fit <- svm_wf_rbf %>%
+  finalize_workflow(select_best(tune_results_svm_rbf, metric="roc_auc")) %>%
+  fit(haiti)
+
+```
+
+```{r}
+haiti_augment_svm_rbf <- augment(svm_rbf_fit, new_data=haiti)
+
+haiti_svm_rbf_cv_predictions <- collect_predictions(svm_rbf_tuned_cv)
+```
+
+```{r cache-rbf-perf}
+performance_svm_rbf <- probably::threshold_perf(haiti_svm_rbf_cv_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+
+```{r}
+max_j_index_svm_rbf <- performance_svm_rbf %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_svm_rbf %>% dplyr::select(-.estimator) %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+metrics_svm_rbf <- pivot_wider(performance_svm_rbf, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+roc_haiti_svm_rbf <- roc_curve(haiti_svm_rbf_cv_predictions, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_svm_rbf, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_svm_rbf, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_svm_rbf
+
+```
+
+
+```{r}
+optimal_threshold_svm_rbf <- max_j_index_svm_rbf[[1,1]]
+optimal_threshold_svm_rbf
+
+metrics_training_svm_rbf <- performance_svm_rbf %>% filter(.threshold == optimal_threshold_svm_rbf)
+metrics_training_svm_rbf <- metrics_training_svm_rbf %>% dplyr::select(-.estimator)
+
+
+metrics_training_svm_rbf %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+svm_rbf_auc <- roc_auc(haiti_augment_svm_rbf, BT_class, .pred_TRUE, event_level="second")
+svm_rbf_auc
+
+specificity_svm_rbf <- metrics_training_svm_rbf %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_rbf <- 1-specificity_svm_rbf
+fpr_svm_rbf
+
+```
+
+```{r cache-svm-rbf-test}
+
+svm_rbf_augment_test <- augment(svm_rbf_fit, new_data=Haiti_holdout)
+```
+
+```{r}
+performance_svm_rbf_test <- probably::threshold_perf(svm_rbf_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+
+```{r}
+metrics_test_svm_rbf <- performance_svm_rbf_test %>% filter(.threshold == optimal_threshold_svm_rbf)
+metrics_test_svm_rbf <- metrics_test_svm_rbf %>% dplyr::select(-.estimator)
+
+
+metrics_test_svm_rbf %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+svm_rbf_test_auc <- roc_auc(svm_rbf_augment_test, BT_class, .pred_TRUE, event_level="second")
+svm_rbf_test_auc
+
+specificity_svm_rbf_test <- metrics_test_svm_rbf %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_svm_rbf_test <- 1-specificity_svm_rbf_test
+fpr_svm_rbf_test
+
+roc_haiti_test_svm_rbf <- roc_curve(svm_rbf_augment_test, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() 
+    #geom_point(data=metrics_test_svm_rbf, aes(x=1-specificity, y=sensitivity), color='red') +
+    #geom_text(data=metrics_test_svm_rbf, aes(x=1-specificity, y=sensitivity, 
+     #         label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_test_svm_rbf
+```
+
+# End cluster
+```{r}
+stopCluster(cl)
+registerDoSEQ()
+```
