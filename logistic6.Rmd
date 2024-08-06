@@ -1,0 +1,318 @@
+---
+title: "Logistic_project_alec"
+author: "Alec Pixton"
+date: "2024-06-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#| warning: FALSE
+#| message: FALSE
+library(tidymodels)
+library(dplyr)
+library(tidyverse)
+library(yardstick)
+library(patchwork)
+library(discrim)
+library(MASS)
+library(ggcorrplot)
+library(GGally)
+```
+
+```{r}
+library(doParallel)
+cl <- makePSOCKcluster(4, outfile="")
+registerDoParallel(cl)
+```
+
+
+```{r}
+set.seed(4896)
+haiti <- read.csv("HaitiPixels.csv", sep=",", header=TRUE)
+haiti$BT_class <- ifelse(haiti$Class == "Blue Tarp", TRUE, FALSE)
+haiti$BT_class <- as.factor(haiti$BT_class)
+haiti <- subset(haiti, select = -Class)
+haiti_formula <- BT_class ~ .
+```
+
+```{r cache-prepare-LDA}
+
+#| message: FALSE
+#| warning: FALSE
+#| cache: TRUE
+
+folds <- vfold_cv(haiti, strata=BT_class)
+
+haiti_logistic <- logistic_reg(mode="classification") %>% 
+    set_engine("glm")
+  
+haiti_logistic_wf <- workflow() %>%
+    add_model(haiti_logistic) %>%
+    add_formula(haiti_formula)
+
+haiti_logistic_fit_cv <- haiti_logistic_wf %>% 
+    fit_resamples(folds, control=control_resamples(save_pred=TRUE))
+
+haiti_logistic_cv_predictions <- collect_predictions(haiti_logistic_fit_cv)
+
+haiti_logistic_cv_metrics <- collect_metrics(haiti_logistic_fit_cv)
+haiti_logistic_cv_metrics
+```
+
+
+
+```{r}
+performance_logistic <- probably::threshold_perf(haiti_logistic_cv_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+max_j_index_logistic <- performance_logistic %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_logistic
+```
+
+
+```{r}
+metrics_logistic <- pivot_wider(performance_logistic, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+```
+```{r}
+roc_logistic <- roc_curve(haiti_logistic_cv_predictions, BT_class, .pred_TRUE, event_level = "second") %>% 
+    autoplot() +
+    geom_point(data=metrics_logistic, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_logistic, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+```
+
+```{r}
+roc_logistic
+```
+
+```{r}
+optimal_threshold_logistic <- max_j_index_logistic[[1,1]]
+optimal_threshold_logistic
+```
+```{r}
+metrics_training_logistic <- performance_logistic %>% filter(.threshold == optimal_threshold_logistic)
+metrics_training_logistic
+```
+```{r}
+haiti_logistic_fit <- haiti_logistic_wf %>% fit(haiti)
+haiti_augment <- augment(haiti_logistic_fit, new_data=haiti)
+logistic_auc <- roc_auc(haiti_augment, BT_class, .pred_TRUE, event_level="second")
+logistic_auc
+```
+
+```{r}
+specificity <- metrics_training_logistic %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr <- 1-specificity
+fpr
+```
+
+```{r}
+# ignoring "orthovnir067_ROI_Blue_Tarps_data.txt", and the .jpg files
+# combining text files for holdout set & separating based on class
+
+non_blue_files <- c("orthovnir057_ROI_NON_Blue_Tarps.txt", "orthovnir067_ROI_NOT_Blue_Tarps.txt", "orthovnir069_ROI_NOT_Blue_Tarps.txt", "orthovnir078_ROI_NON_Blue_Tarps.txt")
+blue_files <- c("orthovnir067_ROI_Blue_Tarps.txt", "orthovnir069_ROI_Blue_Tarps.txt", "orthovnir078_ROI_Blue_Tarps.txt")
+
+
+read_and_label <- function(files, label) {
+  map_df(files, function(file) {
+    data <- read_lines(file, skip = 8)  # Skip metadata
+    
+    df <- read.table(text = data, header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+   
+    df <- df %>% mutate(class = label)
+  
+    colnames(df) <- c("ID", "X", "Y", "Map_X", "Map_Y", "Lat", "Lon", "B1", "B2", "B3", "BT_class")
+    return(df)
+  })
+}
+
+
+non_blue_df <- read_and_label(non_blue_files, "FALSE")
+blue_df <- read_and_label(blue_files, "TRUE")
+
+
+Haiti_holdout <- bind_rows(non_blue_df, blue_df)
+
+Haiti_holdout$BT_class <- as.factor(Haiti_holdout$BT_class)
+
+```
+
+```{r}
+Haiti_holdout <- Haiti_holdout %>%
+  rename(Red = B1,
+         Green = B2,
+         Blue = B3)
+
+Haiti_holdout <- Haiti_holdout %>%
+  dplyr::select(Red, Green, Blue, BT_class)
+```
+
+```{r}
+haiti_augment_test <- augment(haiti_logistic_fit, new_data=Haiti_holdout)
+
+performance_logistic_test <- probably::threshold_perf(haiti_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+
+metrics_test_logistic <- performance_logistic_test %>% filter(.threshold == optimal_threshold_logistic)
+metrics_test_logistic
+
+logisitc_auc <- roc_auc(haiti_augment_test, BT_class, .pred_TRUE, event_level="second")
+logistic_auc
+
+specificity_test_logistic <- metrics_test_logistic %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_test_logistic <- 1-specificity_test_logistic
+fpr_test_logistic
+```
+```{r}
+roc_logistic_test <- roc_curve(haiti_augment_test, BT_class, .pred_TRUE, event_level = "second") %>% 
+    autoplot() +
+    geom_point(data=metrics_logistic, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_logistic, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_logistic_test
+```
+
+
+Elastic Net Regression
+
+```{r}
+haiti_elastic_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune(),
+) %>%
+  set_engine('glmnet') 
+```
+```{r}
+haiti_elastic_recipe <- recipe(haiti_formula, data = haiti) %>%
+  step_dummy(all_nominal_predictors())
+```
+```{r}
+haiti_elastic_wf <- workflow() %>%
+  add_model(haiti_elastic_spec) %>%
+  add_recipe(haiti_elastic_recipe)
+```
+```{r}
+haiti_elastic_tune <- tune_grid(
+  haiti_elastic_wf,
+  resamples = folds,
+  grid = 10,
+  control = control_grid(save_pred = TRUE)
+)
+```
+```{r}
+haiti_elastic_best <- select_best(haiti_elastic_tune, metric = "roc_auc")
+```
+```{r}
+haiti_elastic_final_cv <- finalize_workflow(haiti_elastic_wf, haiti_elastic_best) %>%
+  fit_resamples(resamples=folds, control=control_resamples(save_pred=TRUE))
+```
+```{r}
+haiti_elastic_metrics <- collect_metrics(haiti_elastic_final_cv)
+haiti_elastic_metrics
+```
+```{r}
+haiti_elastic_final <- finalize_workflow(haiti_elastic_wf, haiti_elastic_best) %>%
+  fit(haiti)
+```
+```{r}
+haiti_elastic_augment <- augment(haiti_elastic_final, new_data=haiti)
+
+haiti_elastic_predictions <- collect_predictions(haiti_elastic_final_cv)
+```
+```{r}
+performance_elastic <- probably::threshold_perf(haiti_elastic_predictions, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+```{r}
+max_j_index_elastic <- performance_elastic %>% 
+    filter(.metric == "j_index") %>% 
+    filter(.estimate == max(.estimate))
+max_j_index_elastic %>% dplyr::select(-.estimator) %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+```
+```{r}
+metrics_elastic <- pivot_wider(performance_elastic, id_cols=.threshold, names_from=.metric,
+                       values_from=.estimate)
+```
+```{r}
+roc_haiti_elastic <- roc_curve(haiti_elastic_predictions, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() +
+    geom_point(data=metrics_elastic, aes(x=1-specificity, y=sensitivity), color='red') +
+    geom_text(data=metrics_elastic, aes(x=1-specificity, y=sensitivity, 
+              label=.threshold), nudge_x=0.05, check_overlap=TRUE)
+roc_haiti_elastic
+```
+```{r}
+optimal_threshold_elastic <- max_j_index_elastic[[1,1]]
+optimal_threshold_elastic
+
+metrics_elastic <- performance_elastic %>% filter(.threshold == optimal_threshold_elastic)
+metrics_elastic <- metrics_elastic %>% dplyr::select(-.estimator)
+
+
+metrics_elastic %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+elastic_auc <- roc_auc(haiti_elastic_augment, BT_class, .pred_TRUE, event_level="second")
+elastic_auc
+
+specificity_elastic <- metrics_elastic %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_elastic <- 1-specificity_elastic
+fpr_elastic
+```
+```{r}
+elastic_augment_test <- augment(haiti_elastic_final, new_data=Haiti_holdout)
+```
+```{r}
+performance_elastic_test <- probably::threshold_perf(elastic_augment_test, BT_class, .pred_TRUE, 
+    thresholds=seq(0.05, 0.95, 0.01), event_level="second",
+    metrics=metric_set(j_index, yardstick::specificity, yardstick::sensitivity, accuracy, precision))
+```
+```{r}
+metrics_elastic_test <- performance_elastic_test %>% filter(.threshold == optimal_threshold_elastic)
+metrics_elastic_test <- metrics_elastic_test %>% dplyr::select(-.estimator)
+
+
+metrics_elastic_test %>%
+  rename(
+    Threshold = .threshold,
+    Metric = .metric,
+    Estimate = .estimate
+  )
+
+
+elastic_test_auc <- roc_auc(elastic_augment_test, BT_class, .pred_TRUE, event_level="second")
+elastic_test_auc
+
+specificity_elastic_test <- metrics_elastic_test %>% filter(.metric == "specificity") %>% pull(.estimate)
+fpr_elastic_test <- 1-specificity_elastic_test
+fpr_elastic_test
+
+roc_haiti_test_elastic <- roc_curve(elastic_augment_test, BT_class, .pred_TRUE, event_level="second") %>% 
+    autoplot() 
+roc_haiti_test_elastic
+```
+
+
+
+
+
